@@ -2,7 +2,7 @@
  * Sub-Store 操作脚本：入口运营商 + 国旗改名（批量端点版）
  *
  * 把节点名改为「入口地区+运营商 + 原节点地区旗帜」，如 杭州电信 🇭🇰、美国 AWS 🇺🇸。
- * 查的是入口 server 的归属，不是落地；落地检测见 landing.js。
+ * 查的是入口 server 的归属，不是落地。
  *
  * 默认走 ip-api 批量端点：100 个 IP 一次请求（单条端点是 100 次），
  * 内置滑动窗口限流 + X-Rl/X-Ttl 退避，节点再多也不会被封。
@@ -34,6 +34,13 @@
  *  - dns            指定 DNS，逗号或换行分隔，可写预设名 / DoH URL / 纯 IP
  *                   预设：aliyun dnspod cloudflare google quad9 adguard opendns dnssb
  *                   默认 aliyun,dnspod,cloudflare,google
+ *                   只支持 DoH（脚本沙箱只有 HTTP，没有原始 socket）：
+ *                     · DoH JSON 格式    application/dns-json，GET ?name=&type=
+ *                     · DoH wireformat   RFC 8484 application/dns-message，GET ?dns=base64url
+ *                   URL 末尾可加 #json / #wire 强制格式；无后缀则按路径猜测、失败自动回退。
+ *                   tcp:// udp:// tls://(DoT) quic://(DoQ) 无法在脚本内运行，会跳过并提示；
+ *                   需要这些请先用 Sub-Store 内置「域名解析」操作，本脚本会复用其解析结果。
+ *  - dns_format     auto | json | wire，对未带 #后缀的源生效，默认 auto
  *  - dns_type       ipv4 | ipv6 | ip4p | auto，默认 ipv4
  *  - dns_strategy   fallback（按序回退）| race（并发抢答），默认 fallback
  *  - dns_concurrency  race 模式下同时打的 DNS 数，默认 2
@@ -41,7 +48,7 @@
  *  - dns_timeout    单次 DoH 超时(ms)，默认 3000
  *  - dns_cache      DNS 缓存，默认 true
  *  - dns_cache_ttl  DNS 缓存时长(秒)，默认 3600
- *  - edns           EDNS Client Subnet，如 223.6.6.6，默认不带
+ *  - edns           EDNS Client Subnet，如 223.6.6.6，默认不带（仅 JSON 格式生效）
  *  - write_server   解析结果写回 proxy.server，替代内置「域名解析」，默认 false
  *  - dns_filter     write_server 时过滤：removeFailed | IPOnly | IPv4Only | IPv6Only
  */
@@ -281,36 +288,39 @@ const CARRIER_RULES = [
 const CC_SHORT_NAME = { HK: '香港', MO: '澳门', TW: '台湾' }
 
 const DOH_PRESETS = {
-  aliyun: 'https://223.5.5.5/resolve',
-  alidns: 'https://223.5.5.5/resolve',
-  ali: 'https://223.5.5.5/resolve',
-  dnspod: 'https://1.12.12.12/dns-query',
-  tencent: 'https://1.12.12.12/dns-query',
-  cloudflare: 'https://1.1.1.1/dns-query',
-  cf: 'https://1.1.1.1/dns-query',
-  google: 'https://8.8.8.8/resolve',
-  quad9: 'https://9.9.9.9:5053/dns-query',
-  adguard: 'https://94.140.14.14/dns-query',
-  opendns: 'https://doh.opendns.com/dns-query',
-  dnssb: 'https://doh.sb/dns-query',
-  baidu: 'https://180.76.76.76/dns-query',
+  aliyun: { url: 'https://223.5.5.5/resolve', format: 'json' },
+  alidns: { url: 'https://223.5.5.5/resolve', format: 'json' },
+  ali: { url: 'https://223.5.5.5/resolve', format: 'json' },
+  dnspod: { url: 'https://1.12.12.12/dns-query', format: 'json' },
+  tencent: { url: 'https://1.12.12.12/dns-query', format: 'json' },
+  cloudflare: { url: 'https://1.1.1.1/dns-query', format: 'json' },
+  cf: { url: 'https://1.1.1.1/dns-query', format: 'json' },
+  google: { url: 'https://8.8.8.8/resolve', format: 'json' },
+  quad9: { url: 'https://9.9.9.9:5053/dns-query', format: 'json' },
+  adguard: { url: 'https://94.140.14.14/dns-query', format: 'json' },
+  opendns: { url: 'https://doh.opendns.com/dns-query', format: 'wire' },
+  dnssb: { url: 'https://doh.sb/dns-query', format: 'json' },
+  baidu: { url: 'https://180.76.76.76/dns-query', format: 'wire' },
 }
 
 const DOH_BY_IP = {
-  '223.5.5.5': 'https://223.5.5.5/resolve',
-  '223.6.6.6': 'https://223.6.6.6/resolve',
-  '1.1.1.1': 'https://1.1.1.1/dns-query',
-  '1.0.0.1': 'https://1.0.0.1/dns-query',
-  '8.8.8.8': 'https://8.8.8.8/resolve',
-  '8.8.4.4': 'https://8.8.4.4/resolve',
-  '9.9.9.9': 'https://9.9.9.9:5053/dns-query',
-  '149.112.112.112': 'https://149.112.112.112:5053/dns-query',
-  '1.12.12.12': 'https://1.12.12.12/dns-query',
-  '119.29.29.29': 'https://1.12.12.12/dns-query',
-  '120.53.53.53': 'https://120.53.53.53/dns-query',
-  '180.76.76.76': 'https://180.76.76.76/dns-query',
-  '94.140.14.14': 'https://94.140.14.14/dns-query',
+  '223.5.5.5': { url: 'https://223.5.5.5/resolve', format: 'json' },
+  '223.6.6.6': { url: 'https://223.6.6.6/resolve', format: 'json' },
+  '1.1.1.1': { url: 'https://1.1.1.1/dns-query', format: 'json' },
+  '1.0.0.1': { url: 'https://1.0.0.1/dns-query', format: 'json' },
+  '8.8.8.8': { url: 'https://8.8.8.8/resolve', format: 'json' },
+  '8.8.4.4': { url: 'https://8.8.4.4/resolve', format: 'json' },
+  '9.9.9.9': { url: 'https://9.9.9.9:5053/dns-query', format: 'json' },
+  '149.112.112.112': { url: 'https://149.112.112.112:5053/dns-query', format: 'json' },
+  '1.12.12.12': { url: 'https://1.12.12.12/dns-query', format: 'json' },
+  '119.29.29.29': { url: 'https://1.12.12.12/dns-query', format: 'json' },
+  '120.53.53.53': { url: 'https://120.53.53.53/dns-query', format: 'json' },
+  '180.76.76.76': { url: 'https://180.76.76.76/dns-query', format: 'wire' },
+  '94.140.14.14': { url: 'https://94.140.14.14/dns-query', format: 'json' },
 }
+
+// tcp/udp/tls(DoT)/quic(DoQ) 需要原始 socket，Sub-Store 脚本沙箱只有 $.http，无法实现
+const UNSUPPORTED_DNS_SCHEMES = new Set(['tcp', 'udp', 'tls', 'dot', 'quic', 'doq'])
 
 const IPAPI_FIELDS = 'status,message,query,country,countryCode,city,regionName,isp,org,as,asname,mobile,proxy,hosting'
 const IPAPI_BATCH_URL = 'http://ip-api.com/batch'
@@ -350,6 +360,7 @@ async function operator(proxies = [], targetPlatform, context) {
   const dnsCacheEnabled = bool(args.dns_cache, true) && !!cache
   const dnsCacheTtl = int(args.dns_cache_ttl, 3600, 30, 604800) * 1000
   const edns = args.edns && isIPv4(String(args.edns).trim()) ? String(args.edns).trim() : ''
+  const dnsFormat = normalizeDnsFormat(args.dns_format)
   const dnsFilter = normalizeDnsFilter(args.dns_filter)
   const dnsSources = parseDnsSources(args.dns ?? args.doh)
 
@@ -642,6 +653,22 @@ async function operator(proxies = [], targetPlatform, context) {
   }
 
   async function dohQuery(source, domain, type) {
+    const format = source.format === 'auto' ? dnsFormat : source.format
+    if (format === 'json') return dohJson(source, domain, type)
+    if (format === 'wire') return dohWire(source, domain, type)
+    // auto：先按 JSON 试，失败再按 wireformat 试
+    try {
+      return await dohJson(source, domain, type)
+    } catch (jsonError) {
+      try {
+        return await dohWire(source, domain, type)
+      } catch (wireError) {
+        throw new Error(`json(${jsonError?.message || jsonError}) / wire(${wireError?.message || wireError})`)
+      }
+    }
+  }
+
+  async function dohJson(source, domain, type) {
     let url
     if (/\{\{\s*domain\s*\}\}/.test(source.url)) {
       url = source.url
@@ -670,11 +697,34 @@ async function operator(proxies = [], targetPlatform, context) {
       const typeName = String(answer.type || '').toUpperCase()
       if (answerType !== wantType && typeName !== type) continue
       const ip = String(answer.data || '').trim()
-      const ok = type === 'AAAA' ? isIPv6(ip) : isIPv4(ip) && ip !== '0.0.0.0'
-      if (ok && !ips.includes(ip)) ips.push(ip)
+      if (accept(ip, type) && !ips.includes(ip)) ips.push(ip)
     }
     if (!ips.length) throw new Error('无有效记录')
     return ips.sort()
+  }
+
+  async function dohWire(source, domain, type) {
+    const query = encodeDnsQuery(domain, type)
+    const res = await $.http.get({
+      url: `${source.url}${source.url.includes('?') ? '&' : '?'}dns=${bytesToB64Url(query)}`,
+      timeout: dnsTimeout,
+      headers: { accept: 'application/dns-message', 'user-agent': USER_AGENT },
+      'binary-mode': true,
+      encoding: null,
+    })
+    const status = Number(res?.statusCode ?? res?.status ?? 0)
+    if (status && (status < 200 || status >= 300)) throw new Error(`HTTP ${status}`)
+    const bytes = toBytes(res?.bodyBytes ?? res?.body ?? res?.data ?? res?.rawBody)
+    if (!bytes || bytes.length < 12) throw new Error('wireformat 响应为空')
+    const records = decodeDnsAnswers(bytes, type === 'AAAA' ? 28 : 1)
+    const ips = []
+    for (const ip of records) if (accept(ip, type) && !ips.includes(ip)) ips.push(ip)
+    if (!ips.length) throw new Error('无有效记录')
+    return ips.sort()
+  }
+
+  function accept(ip, type) {
+    return type === 'AAAA' ? isIPv6(ip) : isIPv4(ip) && ip !== '0.0.0.0'
   }
 
   function pickFor(domain, ips) {
@@ -759,34 +809,58 @@ async function operator(proxies = [], targetPlatform, context) {
     for (const token of input.split(/[,\n\r]+/)) {
       const name = token.trim()
       if (!name) continue
-      const url = dnsTokenToUrl(name)
-      if (!url || seen.has(url)) continue
-      seen.add(url)
-      sources.push({ name, url })
+      const source = dnsTokenToSource(name)
+      if (!source || seen.has(source.url)) continue
+      seen.add(source.url)
+      sources.push({ name, url: source.url, format: source.format })
     }
     return sources
   }
 
-  function dnsTokenToUrl(token) {
-    if (/^https?:\/\//i.test(token)) return token
-    const scheme = token.match(/^([a-z][a-z\d+.-]*):\/\//i)
-    let body = token
-    if (scheme) {
-      body = token.slice(scheme[0].length)
-      $.info(`[DNS] 脚本内只支持 DoH，${scheme[1]}:// 已按 DoH 处理: ${token}`)
+  function dnsTokenToSource(token) {
+    // 末尾 #json / #wire 强制格式
+    let forced = ''
+    let text = token
+    const hashMatch = text.match(/#(json|wire|auto)\s*$/i)
+    if (hashMatch) {
+      forced = hashMatch[1].toLowerCase()
+      text = text.slice(0, hashMatch.index).trim()
     }
-    body = body.replace(/\/+$/, '')
+    const scheme = text.match(/^([a-z][a-z\d+.-]*):\/\//i)
+    const schemeName = scheme ? scheme[1].toLowerCase() : ''
+    if (schemeName && UNSUPPORTED_DNS_SCHEMES.has(schemeName)) {
+      $.error(`[DNS] 脚本沙箱只有 HTTP，无法用 ${schemeName}:// (${schemeName === 'tls' || schemeName === 'dot' ? 'DoT' : schemeName === 'quic' || schemeName === 'doq' ? 'DoQ' : '明文 DNS'})，已跳过: ${token}。需要请先用 Sub-Store 内置「域名解析」`)
+      return null
+    }
+    const withFormat = (url, defFormat) => ({ url, format: forced || defFormat })
+
+    if (/^https?:\/\//i.test(text)) return withFormat(text, guessFormat(text))
+    if (schemeName === 'doh' || schemeName === 'https' || schemeName === 'h3') {
+      const url = `https://${text.slice(scheme[0].length)}`
+      return withFormat(url, guessFormat(url))
+    }
+
+    let body = text.replace(/\/+$/, '')
     const preset = DOH_PRESETS[body.toLowerCase()]
-    if (preset) return preset
+    if (preset) return withFormat(preset.url, preset.format)
     const host = body.replace(/^\[|\]$/g, '').split('/')[0]
-    if (DOH_BY_IP[host]) return DOH_BY_IP[host]
+    if (DOH_BY_IP[host]) return withFormat(DOH_BY_IP[host].url, DOH_BY_IP[host].format)
     if (isIP(host)) {
-      $.info(`[DNS] ${host} 未知 DoH 路径，按 https://${host}/dns-query 尝试`)
-      return `https://${host}/dns-query`
+      const url = `https://${host}/dns-query`
+      $.info(`[DNS] ${host} 未知 DoH 路径，按 ${url} 尝试`)
+      return withFormat(url, forced || 'auto')
     }
-    if (/^[a-z\d.-]+\.[a-z]{2,}$/i.test(body)) return `https://${body}/dns-query`
+    if (/^[a-z\d.-]+\.[a-z]{2,}$/i.test(body)) {
+      const url = `https://${body}/dns-query`
+      return withFormat(url, guessFormat(url))
+    }
     $.error(`[DNS] 无法识别的 DNS 配置，已跳过: ${token}`)
-    return ''
+    return null
+  }
+
+  function guessFormat(url) {
+    if (/\/resolve(\?|$)/i.test(url) || /\{\{\s*domain\s*\}\}/.test(url)) return 'json'
+    return 'auto'
   }
 
   function parseJson(res) {
@@ -930,6 +1004,135 @@ function normalizeDnsFilter(value) {
   if (filter === 'ipv4only') return 'IPv4Only'
   if (filter === 'ipv6only') return 'IPv6Only'
   return ''
+}
+
+function normalizeDnsFormat(value) {
+  const format = String(value || 'auto').trim().toLowerCase()
+  if (format === 'json') return 'json'
+  if (format === 'wire' || format === 'wireformat' || format === 'message') return 'wire'
+  return 'auto'
+}
+
+// ---- DoH wireformat (RFC 8484) 编解码，纯 JS 无依赖 ----
+
+function encodeDnsQuery(domain, type) {
+  const qtype = type === 'AAAA' ? 28 : 1
+  const out = [0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+  for (const label of String(domain).split('.')) {
+    if (!label) continue
+    const bytes = labelBytes(label)
+    if (bytes.length > 63) throw new Error('域名标签过长')
+    out.push(bytes.length, ...bytes)
+  }
+  out.push(0x00, (qtype >> 8) & 0xff, qtype & 0xff, 0x00, 0x01)
+  return Uint8Array.from(out)
+}
+
+function labelBytes(label) {
+  const out = []
+  for (const ch of label) {
+    const code = ch.codePointAt(0)
+    if (code < 0x80) {
+      out.push(code)
+    } else if (code < 0x800) {
+      out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f))
+    } else if (code < 0x10000) {
+      out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f))
+    } else {
+      out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f))
+    }
+  }
+  return out
+}
+
+function decodeDnsAnswers(bytes, wantType) {
+  const rcode = bytes[3] & 0x0f
+  if (rcode !== 0) throw new Error(`DNS RCODE=${rcode}`)
+  const qd = (bytes[4] << 8) | bytes[5]
+  const an = (bytes[6] << 8) | bytes[7]
+  let offset = 12
+  for (let i = 0; i < qd; i++) offset = skipName(bytes, offset) + 4
+  const results = []
+  for (let i = 0; i < an && offset + 10 <= bytes.length; i++) {
+    offset = skipName(bytes, offset)
+    const type = (bytes[offset] << 8) | bytes[offset + 1]
+    const rdlength = (bytes[offset + 8] << 8) | bytes[offset + 9]
+    const rdata = offset + 10
+    if (type === wantType) {
+      if (type === 1 && rdlength === 4) {
+        results.push(`${bytes[rdata]}.${bytes[rdata + 1]}.${bytes[rdata + 2]}.${bytes[rdata + 3]}`)
+      } else if (type === 28 && rdlength === 16) {
+        const groups = []
+        for (let j = 0; j < 16; j += 2) groups.push(((bytes[rdata + j] << 8) | bytes[rdata + j + 1]).toString(16))
+        results.push(compressIPv6(groups))
+      }
+    }
+    offset = rdata + rdlength
+  }
+  return results
+}
+
+function skipName(bytes, offset) {
+  while (offset < bytes.length) {
+    const len = bytes[offset]
+    if (len === undefined) break
+    if ((len & 0xc0) === 0xc0) return offset + 2
+    if (len === 0) return offset + 1
+    offset += 1 + len
+  }
+  return offset
+}
+
+function compressIPv6(groups) {
+  let bestStart = -1
+  let bestLen = 0
+  let curStart = -1
+  let curLen = 0
+  for (let i = 0; i < groups.length; i++) {
+    if (groups[i] === '0') {
+      if (curStart === -1) curStart = i
+      curLen++
+      if (curLen > bestLen) {
+        bestLen = curLen
+        bestStart = curStart
+      }
+    } else {
+      curStart = -1
+      curLen = 0
+    }
+  }
+  if (bestLen < 2) return groups.join(':')
+  const head = groups.slice(0, bestStart).join(':')
+  const tail = groups.slice(bestStart + bestLen).join(':')
+  return `${head}::${tail}`
+}
+
+function toBytes(raw) {
+  if (raw === null || raw === undefined) return null
+  const tag = Object.prototype.toString.call(raw)
+  if (tag === '[object Uint8Array]' || tag === '[object Buffer]') return new Uint8Array(raw)
+  if (tag === '[object ArrayBuffer]' || tag === '[object SharedArrayBuffer]') return new Uint8Array(raw)
+  if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView && ArrayBuffer.isView(raw)) {
+    return new Uint8Array(raw.buffer, raw.byteOffset || 0, raw.byteLength)
+  }
+  if (Array.isArray(raw)) return Uint8Array.from(raw)
+  if (typeof raw === 'string') return Uint8Array.from([...raw].map(ch => ch.charCodeAt(0) & 0xff))
+  return null
+}
+
+function bytesToB64Url(bytes) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+  let out = ''
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i]
+    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0
+    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0
+    out += chars[b0 >> 2]
+    out += chars[((b0 & 3) << 4) | (b1 >> 4)]
+    out += i + 1 < bytes.length ? chars[((b1 & 15) << 2) | (b2 >> 6)] : ''
+    out += i + 2 < bytes.length ? chars[b2 & 63] : ''
+  }
+  return out
 }
 
 function ccFlag(cc) {

@@ -22,6 +22,21 @@ ip-api 免费单条端点限 **45 次/分钟**，超限返回 `HTTP 429`，持�
 
 默认 `aliyun,dnspod,cloudflare,google`。`dns_strategy=fallback`（默认）按序回退，`race` 并发抢答。支持 `dns_type`（ipv4/ipv6/ip4p/auto）、`edns`（EDNS Client Subnet）。同一域名多条记录取字典序最小，保证多次运行命名稳定。
 
+### 支持哪些 DNS 类型
+
+Sub-Store 操作脚本的沙箱里只有 HTTP 客户端（`$.http`），没有原始 UDP/TCP/TLS socket，所以脚本内**只能做 DoH**。DoH 两种格式都支持：
+
+| 写法 | 类型 | 说明 |
+| --- | --- | --- |
+| `https://.../resolve?name=` | DoH **JSON**（`application/dns-json`） | Cloudflare / Google / AliDNS / Quad9 等 |
+| `https://.../dns-query` | DoH **wireformat**（RFC 8484，`application/dns-message`） | 标准 DoH，`GET ?dns=<base64url>`，纯 JS 编解码无依赖 |
+| `tcp://` `udp://` | 明文 DNS | ❌ 需原始 socket，脚本内不可用 |
+| `tls://`（DoT）`quic://`（DoQ） | 加密 DNS | ❌ 需原始 socket，脚本内不可用 |
+
+格式选择：URL 是 `/resolve` 走 JSON，其余默认 `auto`（先按 JSON 试，失败自动回退 wireformat）。可用 `dns_format=json|wire` 全局指定，或在单个 URL 末尾加 `#json`/`#wire` 强制，例如 `https://doh.sb/dns-query#wire`。`edns` 仅在 JSON 格式下生效。
+
+需要 TCP/UDP/DoT/DoQ 时，请先在本脚本前面加一个 Sub-Store 内置「域名解析」操作（它是核心代码，有 socket 权限，支持 `udp://`/`tcp://`/`tls://`/`https://`）；它把 `server` 改写成 IP 后，本脚本会直接复用该 IP，不再重复解析。
+
 ### 替代 Sub-Store 内置「域名解析」
 
 设 `write_server=true`，脚本会把解析结果写回 `proxy.server`，并同步 `_domain`、`resolved`、`_IPv4`/`_IPv6`、`_IP`、`_resolved_ips`、`_IP4P` 等字段，字段契约与 Sub-Store 内置「域名解析」操作一致，可直接替代它——一步完成「指定 DNS 解析 + 入口改名」。尊重节点的 `no-resolve` 标记，`dns_filter` 支持 `removeFailed`/`IPOnly`/`IPv4Only`/`IPv6Only`。不设 `write_server` 时只用解析结果查询，不改动 `server`。
@@ -70,7 +85,8 @@ DNS：
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `resolve` | `true` | 查询前把域名解析成 IP |
-| `dns` | `aliyun,dnspod,cloudflare,google` | 指定 DNS，预设名/IP/DoH URL |
+| `dns` | `aliyun,dnspod,cloudflare,google` | 指定 DNS，预设名/IP/DoH URL，末尾可加 `#json`/`#wire` |
+| `dns_format` | `auto` | `auto`/`json`/`wire`，对未带 `#` 后缀的源生效 |
 | `dns_type` | `ipv4` | `ipv4`/`ipv6`/`ip4p`/`auto` |
 | `dns_strategy` | `fallback` | `fallback` 按序回退 / `race` 并发抢答 |
 | `dns_concurrency` | `2` | race 模式并发 DNS 数 |
@@ -85,5 +101,4 @@ DNS：
 ## 说明
 
 - 免费端点只走明文 **HTTP**，节点服务器地址会以明文发送给 ip-api，不允许商业用途。
-- 落地检测（穿过节点查真实出口）见 `landing.js`，依赖本机 http-meta。
-- 回归测试见 `test.mjs`：`node test.mjs`。
+- 回归测试见 `test.mjs`：`node test.mjs`（含 DoH wireformat 编解码用例）。

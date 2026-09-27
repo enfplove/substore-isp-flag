@@ -577,5 +577,148 @@ console.log('\n=== 13. 工具函数 ===')
   })
 }
 
+console.log('\n=== 14. DoH wireformat (RFC 8484) ===')
+{
+  const { sandbox } = makeEnv({ args: {}, http: ipapiHandler({}) })
+  const encodeDnsQuery = vm.runInContext('encodeDnsQuery', sandbox)
+  const decodeDnsAnswers = vm.runInContext('decodeDnsAnswers', sandbox)
+  const bytesToB64Url = vm.runInContext('bytesToB64Url', sandbox)
+  const compressIPv6 = vm.runInContext('compressIPv6', sandbox)
+  const normalizeDnsFormat = vm.runInContext('normalizeDnsFormat', sandbox)
+
+  test('真实 Cloudflare 响应能解出 1.0.0.1 / 1.1.1.1', () => {
+    const bytes = new Uint8Array(Buffer.from('AACBgAABAAIAAAAAA29uZQNvbmUDb25lA29uZQAAAQABwAwAAQABAAFFQAAEAQAAAcAMAAEAAQABRUAABAEBAQE=', 'base64'))
+    const ips = plain(decodeDnsAnswers(bytes, 1)).sort()
+    assert.deepStrictEqual(ips, ['1.0.0.1', '1.1.1.1'])
+  })
+  test('encodeDnsQuery 头部与问题段正确', () => {
+    const q = encodeDnsQuery('example.com', 'A')
+    // header: id=0, flags=0x0100(RD), qd=1
+    assert.deepStrictEqual([...q.slice(0, 12)], [0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+    // 问题段: 7 example 3 com 0 + qtype 0x0001 + qclass 0x0001
+    const q2 = [...q.slice(12)]
+    assert.deepStrictEqual(q2, [7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0, 0, 1, 0, 1])
+  })
+  test('AAAA 记录解码 + 零段压缩', () => {
+    // 手工构造: 头 + 问题(a.) + 1 条 AAAA = 2606:4700:4700::1111
+    const bytes = Uint8Array.from([
+      0, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0,
+      1, 97, 0, 0, 28, 0, 1, // 问题 "a" AAAA IN
+      0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 1, 0, 0, 16,
+      0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
+    ])
+    assert.deepStrictEqual(plain(decodeDnsAnswers(bytes, 28)), ['2606:4700:4700::1111'])
+  })
+  test('compressIPv6 压缩最长零段', () => {
+    assert.strictEqual(compressIPv6(['2606', '4700', '4700', '0', '0', '0', '0', '1111']), '2606:4700:4700::1111')
+    assert.strictEqual(compressIPv6(['fe80', '0', '0', '0', '0', '0', '0', '1']), 'fe80::1')
+    assert.strictEqual(compressIPv6(['1', '2', '3', '4', '5', '6', '7', '8']), '1:2:3:4:5:6:7:8')
+  })
+  test('base64url 无填充且字符集正确', () => {
+    assert.strictEqual(bytesToB64Url(Uint8Array.from([0, 0, 1, 0])), 'AAABAA')
+    assert.ok(!/[+/=]/.test(bytesToB64Url(Uint8Array.from([251, 255, 191])) ))
+  })
+  test('normalizeDnsFormat', () => {
+    assert.strictEqual(normalizeDnsFormat('wire'), 'wire')
+    assert.strictEqual(normalizeDnsFormat('JSON'), 'json')
+    assert.strictEqual(normalizeDnsFormat(undefined), 'auto')
+  })
+}
+
+function buildWireA(qname, ips) {
+  const out = [0, 0, 0x81, 0x80, 0, 1, (ips.length >> 8) & 0xff, ips.length & 0xff, 0, 0, 0, 0]
+  for (const label of qname.split('.')) {
+    out.push(label.length, ...[...label].map(c => c.charCodeAt(0)))
+  }
+  out.push(0, 0, 1, 0, 1)
+  for (const ip of ips) {
+    out.push(0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0, 0, 4, ...ip.split('.').map(Number))
+  }
+  return Uint8Array.from(out)
+}
+
+function wireDnsHttp(state = {}, table = {}) {
+  const base = ipapiHandler(state)
+  return (method, opts) => {
+    const url = String(opts.url)
+    if (/[?&]dns=/.test(url)) {
+      state.wireCalls = (state.wireCalls || 0) + 1
+      const domain = Object.keys(table)[0]
+      return Promise.resolve({ statusCode: 200, headers: {}, body: buildWireA(domain, table[domain]).buffer })
+    }
+    if (/[?&]name=/.test(url)) {
+      // JSON 尝试：本源不支持 JSON，返回非 JSON 触发回退
+      state.jsonCalls = (state.jsonCalls || 0) + 1
+      if (state.jsonReturnsGarbage) return Promise.resolve({ statusCode: 200, headers: {}, body: '\x00\x01not-json' })
+    }
+    return base(method, opts)
+  }
+}
+
+await testAsync('#wire 强制走 wireformat 并成功解析改名', async () => {
+  const state = {}
+  const { operator } = makeEnv({
+    args: { cache: 'false', dns_cache: 'false', dns: 'https://doh.example/dns-query#wire' },
+    http: wireDnsHttp(state, { 'us.example.com': ['198.51.100.9'] }),
+  })
+  const out = await operator([{ name: '美国 US1', server: 'us.example.com' }], 'Clash', {})
+  assert.strictEqual(state.wireCalls, 1, `wireCalls=${state.wireCalls}`)
+  assert.strictEqual(state.jsonCalls || 0, 0, 'wire 模式不应发 JSON 请求')
+  assert.strictEqual(out[0].name, '美国 AWS 🇺🇸')
+})
+await testAsync('auto：JSON 失败后回退 wireformat', async () => {
+  const state = { jsonReturnsGarbage: true }
+  const { operator } = makeEnv({
+    args: { cache: 'false', dns_cache: 'false', dns: 'https://doh.example/dns-query' },
+    http: wireDnsHttp(state, { 'us.example.com': ['198.51.100.9'] }),
+  })
+  const out = await operator([{ name: '美国 US1', server: 'us.example.com' }], 'Clash', {})
+  assert.ok((state.jsonCalls || 0) >= 1, '应先尝试 JSON')
+  assert.strictEqual(state.wireCalls, 1, '应回退到 wire')
+  assert.strictEqual(out[0].name, '美国 AWS 🇺🇸')
+})
+await testAsync('dns_format=wire 全局强制 wire', async () => {
+  const state = {}
+  const { operator } = makeEnv({
+    args: { cache: 'false', dns_cache: 'false', dns: 'https://doh.example/dns-query', dns_format: 'wire' },
+    http: wireDnsHttp(state, { 'us.example.com': ['198.51.100.9'] }),
+  })
+  await operator([{ name: '美国 US1', server: 'us.example.com' }], 'Clash', {})
+  assert.strictEqual(state.wireCalls, 1)
+  assert.strictEqual(state.jsonCalls || 0, 0)
+})
+
+console.log('\n=== 15. 不支持的 DNS 类型（tcp/udp/tls/quic）===')
+await testAsync('tcp:// 被跳过并提示，节点保留原名', async () => {
+  const state = {}
+  const { operator, log } = makeEnv({
+    args: { cache: 'false', dns_cache: 'false', dns: 'tcp://8.8.8.8' },
+    http: ipapiHandler(state),
+  })
+  const out = await operator([{ name: '美国 US1', server: 'us.example.com' }], 'Clash', {})
+  assert.strictEqual(state.dohCalls || 0, 0, '不应发起任何 DNS 请求')
+  assert.ok(log.error.some(l => l.includes('tcp://') && l.includes('域名解析')), '应提示改用内置域名解析')
+  assert.strictEqual(out[0].name, '美国 US1', '无可用 DNS 源，域名节点保留原名')
+})
+await testAsync('tls://(DoT) 与 quic://(DoQ) 也被跳过', async () => {
+  const state = {}
+  const { operator, log } = makeEnv({
+    args: { cache: 'false', dns_cache: 'false', dns: 'tls://dns.google, quic://dns.adguard.com' },
+    http: ipapiHandler(state),
+  })
+  await operator([{ name: '美国 US1', server: 'us.example.com' }], 'Clash', {})
+  assert.ok(log.error.some(l => l.includes('DoT')), 'tls 应标注 DoT')
+  assert.ok(log.error.some(l => l.includes('DoQ')), 'quic 应标注 DoQ')
+})
+await testAsync('混合列表：跳过 tcp，保留可用 DoH 源', async () => {
+  const state = { dns: { 'us.example.com|A': ['198.51.100.9'] } }
+  const { operator } = makeEnv({
+    args: { cache: 'false', dns_cache: 'false', dns: 'tcp://8.8.8.8, aliyun' },
+    http: ipapiHandler(state),
+  })
+  const out = await operator([{ name: '美国 US1', server: 'us.example.com' }], 'Clash', {})
+  assert.strictEqual(out[0].name, '美国 AWS 🇺🇸', 'aliyun 源应正常工作')
+})
+
 console.log(`\n${failed === 0 ? '全部通过' : '有失败项'}：${passed} passed, ${failed} failed\n`)
 process.exit(failed === 0 ? 0 : 1)
