@@ -8,38 +8,11 @@ Sub-Store 操作脚本，把节点名改为「入口地区+运营商 + 原节点
 
 ip-api 免费单条端点限 **45 次/分钟**，超限返回 `HTTP 429`，持续超限封 IP 1 小时。旧版逐节点发请求，订阅一大就会大面积失败。
 
-现在默认走 ip-api **批量端点**（`POST /batch`，一次最多 100 个 IP，限 15 次/分钟）：100 个节点从 100 次请求压到 1 次。脚本内置滑动窗口限流，并读取 `X-Rl`/`X-Ttl` 响应头，配额用尽时自动退避、遇到 429 按 `X-Ttl` 等待重试。同一入口域名/IP 的多个节点会先去重再查询。
+现在默认走 ip-api **批量端点**（`POST /batch`，一次最多 100 个 IP，限 15 次/分钟）：100 个节点从 100 次请求压到 1 次。脚本内置滑动窗口限流，并读取 `X-Rl`/`X-Ttl` 响应头，配额用尽时自动退避、遇到 429 按 `X-Ttl` 等待重试。同一入口 IP 的多个节点会先去重再查询。
 
-批量端点只接受 IP，所以脚本会先做 DNS 解析拿到入口 IP 再批量查询。域名无法解析时该目标回退单条端点。设了自定义 `api` 会自动切回单条模式。
+批量端点只接受 IP。所以 `server` 是 IP 的节点走批量端点；`server` 是域名的节点走单条端点（由 ip-api 服务端自行解析域名），单条端点限 45 次/分钟。设了自定义 `api` 会整体切回单条模式。
 
-## 指定 DNS 解析
-
-内置 DoH 解析，`dns` 参数可指定解析服务器，逗号或换行分隔，三种写法都认：
-
-- 预设名：`aliyun` `dnspod` `cloudflare` `google` `quad9` `adguard` `opendns` `dnssb` `baidu`
-- 纯 IP：`223.5.5.5`、`1.1.1.1`（内置常见公共 DNS 的 DoH 路径映射，其余按 `https://<ip>/dns-query` 尝试）
-- 完整 DoH URL：`https://doh.pub/dns-query`
-
-默认 `aliyun,dnspod,cloudflare,google`。`dns_strategy=fallback`（默认）按序回退，`race` 并发抢答。支持 `dns_type`（ipv4/ipv6/ip4p/auto）、`edns`（EDNS Client Subnet）。同一域名多条记录取字典序最小，保证多次运行命名稳定。
-
-### 支持哪些 DNS 类型
-
-Sub-Store 操作脚本的沙箱里只有 HTTP 客户端（`$.http`），没有原始 UDP/TCP/TLS socket，所以脚本内**只能做 DoH**。DoH 两种格式都支持：
-
-| 写法 | 类型 | 说明 |
-| --- | --- | --- |
-| `https://.../resolve?name=` | DoH **JSON**（`application/dns-json`） | Cloudflare / Google / AliDNS / Quad9 等 |
-| `https://.../dns-query` | DoH **wireformat**（RFC 8484，`application/dns-message`） | 标准 DoH，`GET ?dns=<base64url>`，纯 JS 编解码无依赖 |
-| `tcp://` `udp://` | 明文 DNS | ❌ 需原始 socket，脚本内不可用 |
-| `tls://`（DoT）`quic://`（DoQ） | 加密 DNS | ❌ 需原始 socket，脚本内不可用 |
-
-格式选择：URL 是 `/resolve` 走 JSON，其余默认 `auto`（先按 JSON 试，失败自动回退 wireformat）。可用 `dns_format=json|wire` 全局指定，或在单个 URL 末尾加 `#json`/`#wire` 强制，例如 `https://doh.sb/dns-query#wire`。`edns` 仅在 JSON 格式下生效。
-
-需要 TCP/UDP/DoT/DoQ 时，请先在本脚本前面加一个 Sub-Store 内置「域名解析」操作（它是核心代码，有 socket 权限，支持 `udp://`/`tcp://`/`tls://`/`https://`）；它把 `server` 改写成 IP 后，本脚本会直接复用该 IP，不再重复解析。
-
-### 替代 Sub-Store 内置「域名解析」
-
-设 `write_server=true`，脚本会把解析结果写回 `proxy.server`，并同步 `_domain`、`resolved`、`_IPv4`/`_IPv6`、`_IP`、`_resolved_ips`、`_IP4P` 等字段，字段契约与 Sub-Store 内置「域名解析」操作一致，可直接替代它——一步完成「指定 DNS 解析 + 入口改名」。尊重节点的 `no-resolve` 标记，`dns_filter` 支持 `removeFailed`/`IPOnly`/`IPv4Only`/`IPv6Only`。不设 `write_server` 时只用解析结果查询，不改动 `server`。
+想让域名节点也享受批量端点，可以在本脚本**前面**先接一个 Sub-Store 内置「域名解析」操作（它是核心代码、有 socket 权限，支持 `udp://`/`tcp://`/`tls://`/`https://`），把 `server` 改写成 IP；本脚本对已是 IP 的 `server` 自动走批量。
 
 ## 旗帜识别：关键词优先，emoji 兜底
 
@@ -80,25 +53,15 @@ Sub-Store 操作脚本的沙箱里只有 HTTP 客户端（`$.http`），没有�
 | `number` | `true` | 重名自动编号 |
 | `number_sep` | 空格 | 编号分隔符 |
 
-DNS：
+## 域名入口
 
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `resolve` | `true` | 查询前把域名解析成 IP |
-| `dns` | `aliyun,dnspod,cloudflare,google` | 指定 DNS，预设名/IP/DoH URL，末尾可加 `#json`/`#wire` |
-| `dns_format` | `auto` | `auto`/`json`/`wire`，对未带 `#` 后缀的源生效 |
-| `dns_type` | `ipv4` | `ipv4`/`ipv6`/`ip4p`/`auto` |
-| `dns_strategy` | `fallback` | `fallback` 按序回退 / `race` 并发抢答 |
-| `dns_concurrency` | `2` | race 模式并发 DNS 数 |
-| `dns_pick` | `first` | `first` 字典序最小（命名稳定）/ `random` |
-| `dns_timeout` | `3000` | 单次 DoH 超时(ms) |
-| `dns_cache` | `true` | DNS 缓存 |
-| `dns_cache_ttl` | `3600` | DNS 缓存时长(秒) |
-| `edns` | 无 | EDNS Client Subnet，如 `223.6.6.6` |
-| `write_server` | `false` | 解析结果写回 `server`，替代内置「域名解析」 |
-| `dns_filter` | 无 | `write_server` 时过滤：`removeFailed`/`IPOnly`/`IPv4Only`/`IPv6Only` |
+脚本不再内置自定义 DNS。原因：Sub-Store 操作脚本的沙箱里只有 HTTP 客户端（`$.http`），没有原始 UDP/TCP/TLS socket，脚本内顶多只能做 DoH，做不了 `tcp`/`udp`/`tls`(DoT)/`quic`(DoQ)。与其做半套，不如交给专业的：
+
+- `server` 是 IP → 批量端点（高效）。
+- `server` 是域名 → 单条端点，ip-api 服务端自行解析。
+- 想让域名也走批量、或想指定 `tcp`/`tls`/`doh` 解析：在本脚本前面接 Sub-Store 内置「域名解析」操作，它把域名转成 IP 后本脚本自动批量。
 
 ## 说明
 
 - 免费端点只走明文 **HTTP**，节点服务器地址会以明文发送给 ip-api，不允许商业用途。
-- 回归测试见 `test.mjs`：`node test.mjs`（含 DoH wireformat 编解码用例）。
+- 回归测试见 `test.mjs`：`node test.mjs`。
