@@ -80,6 +80,8 @@ const IPAPI = {
   '203.0.113.7': { status: 'success', query: '203.0.113.7', country: '中国', countryCode: 'CN', city: '杭州市', regionName: '浙江省', isp: 'China Telecom', org: '', as: 'AS4134 Chinanet', asname: 'CHINANET-BACKBONE' },
   '198.51.100.9': { status: 'success', query: '198.51.100.9', country: '美国', countryCode: 'US', city: 'Ashburn', isp: 'Amazon.com', org: 'AWS EC2', as: 'AS16509', asname: 'AMAZON-02', hosting: true },
   '192.0.2.5': { status: 'success', query: '192.0.2.5', country: '中国香港', countryCode: 'HK', city: 'Hong Kong', isp: 'China Mobile International', org: 'CMI', as: 'AS58453', asname: 'CMI-INT-HK' },
+  '198.51.100.60': { status: 'success', query: '198.51.100.60', country: '美国', countryCode: 'US', city: 'Dallas', isp: 'Latitude.sh LTDA', org: 'Latitude.sh', as: 'AS137409 Latitude.sh', asname: 'LATITUDE-SH', hosting: true },
+  '198.51.100.61': { status: 'success', query: '198.51.100.61', country: '美国', countryCode: 'US', city: 'Seattle', isp: '', org: '', as: '', asname: '', hosting: true },
   '10.0.0.1': { status: 'fail', query: '10.0.0.1', message: 'private range' },
 }
 
@@ -278,9 +280,6 @@ await testAsync('纯本地用例：三个同名 + 一个已占位', async () => 
 
 console.log('\n=== 8. 运营商分类 ===')
 await testAsync('分类结果符合预期', async () => {
-  const state = {}
-  const { sandbox } = makeEnv({ args: {}, http: ipapiHandler(state) })
-  // classifyProvider 在 operator 作用域内，这里通过整体流程间接验证
   const { operator } = makeEnv({ args: { cache: 'false' }, http: ipapiHandler({}) })
   const out = await operator(
     [
@@ -296,6 +295,19 @@ await testAsync('分类结果符合预期', async () => {
   assert.strictEqual(out[1].name, '美国 AWS 🇺🇸')
   assert.strictEqual(out[2].name, '杭州电信 🇨🇳')
   assert.strictEqual(out[3].name, 'Cloudflare 🇦🇺', 'anycast 不带地区前缀')
+})
+await testAsync('未在 CLOUD_RULES 里的托管商显示真实名字，而不是笼统「云厂商」', async () => {
+  const { operator } = makeEnv({ args: { cache: 'false' }, http: ipapiHandler({}) })
+  const out = await operator(
+    [
+      { name: '美国 A1', server: '198.51.100.60' },
+      { name: '美国 A2', server: '198.51.100.61' },
+    ],
+    'Clash',
+    {}
+  )
+  assert.strictEqual(out[0].name, '美国 Latitude.sh 🇺🇸', '有 org/isp 名字时应展示真实名字')
+  assert.strictEqual(out[1].name, '美国 云厂商 🇺🇸', '连名字都没有的托管商才退回「云厂商」')
 })
 
 console.log('\n=== 11. 信息节点与失败兜底 ===')
@@ -386,6 +398,7 @@ console.log('\n=== 13. 工具函数 ===')
   const isIPv4 = vm.runInContext('isIPv4', sandbox)
   const isIPv6 = vm.runInContext('isIPv6', sandbox)
   const ccFlag = vm.runInContext('ccFlag', sandbox)
+  const compareIPv4 = vm.runInContext('compareIPv4', sandbox)
   test('isIPv4', () => {
     assert.ok(isIPv4('1.2.3.4'))
     assert.ok(isIPv4('0.0.0.0'))
@@ -405,7 +418,54 @@ console.log('\n=== 13. 工具函数 ===')
     assert.strictEqual(ccFlag('us'), '🇺🇸')
     assert.strictEqual(ccFlag('XYZ'), '')
   })
+  test('compareIPv4 数值排序（取最小 IP 保证结果稳定）', () => {
+    const ips = ['106.13.252.49', '43.136.54.216', '106.55.180.234']
+    assert.strictEqual([...ips].sort(compareIPv4)[0], '43.136.54.216')
+  })
 }
+
+console.log('\n=== 14. 域名入口先经 DoH 解析成 IP ===')
+await testAsync('GeoDNS 域名：按 DoH 解析出的国内 IP 定归属（而不是 ip-api 境外解析域名）', async () => {
+  const calls = { doh: 0, batch: 0, single: 0 }
+  const http = (method, opts) => {
+    const url = String(opts.url)
+    if (/\/resolve\?/.test(url)) {
+      calls.doh++
+      return Promise.resolve({ statusCode: 200, headers: {}, body: JSON.stringify({ Answer: [{ type: 1, data: '106.55.180.234' }, { type: 1, data: '43.136.54.216' }] }) })
+    }
+    if (method === 'post' && /\/batch/.test(url)) {
+      calls.batch++
+      const ips = JSON.parse(opts.body)
+      return Promise.resolve({
+        statusCode: 200,
+        headers: { 'x-rl': '10', 'x-ttl': '60' },
+        body: JSON.stringify(ips.map(ip => ip === '43.136.54.216'
+          ? { status: 'success', query: ip, countryCode: 'CN', city: '广州市', isp: 'Shenzhen Tencent Computer Systems Company Limited', org: 'Tencent Cloud', as: 'AS45090 Tencent', asname: 'TENCENT-NET-AP', hosting: true }
+          : { status: 'fail', query: ip })),
+      })
+    }
+    calls.single++
+    return Promise.resolve({ statusCode: 200, headers: {}, body: JSON.stringify({ status: 'success', query: 'x', countryCode: 'BR', city: 'Sao Paulo', as: 'AS48266 Catixs Ltd', asname: 'Catixs', hosting: false }) })
+  }
+  const { operator } = makeEnv({ args: { cache: 'false' }, http })
+  const out = await operator([{ name: '🇭🇰 HK-01', server: 'geo.example.com' }], 'Clash', {})
+  assert.ok(calls.doh >= 1, '应发起过 DoH 解析')
+  assert.strictEqual(calls.single, 0, '解析成功后不应再按域名走单条端点')
+  assert.strictEqual(out[0].name, '广州腾讯云 🇭🇰', `多条 A 记录应取最小 IP(腾讯)，实际: ${out[0].name}`)
+})
+await testAsync('dns=false 时保持旧行为：直接把域名交给 ip-api，不做 DoH', async () => {
+  const calls = { doh: 0, single: 0 }
+  const http = (method, opts) => {
+    const url = String(opts.url)
+    if (/\/resolve\?/.test(url)) { calls.doh++; return Promise.resolve({ statusCode: 200, headers: {}, body: '{"Answer":[]}' }) }
+    calls.single++
+    return Promise.resolve({ statusCode: 200, headers: {}, body: JSON.stringify({ status: 'success', query: 'geo.example.com', country: '巴西', countryCode: 'BR', city: 'Sao Paulo', as: 'AS48266 Catixs Ltd', asname: 'Catixs', hosting: false }) })
+  }
+  const { operator } = makeEnv({ args: { cache: 'false', dns: 'false', batch: 'false' }, http })
+  const out = await operator([{ name: '🇭🇰 HK-01', server: 'geo.example.com' }], 'Clash', {})
+  assert.strictEqual(calls.doh, 0, 'dns=false 不应发起 DoH')
+  assert.strictEqual(out[0].name, '巴西 Catixs 🇭🇰', `实际: ${out[0].name}`)
+})
 
 console.log(`\n${failed === 0 ? '全部通过' : '有失败项'}：${passed} passed, ${failed} failed\n`)
 process.exit(failed === 0 ? 0 : 1)

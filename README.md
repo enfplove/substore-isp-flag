@@ -10,9 +10,9 @@ ip-api 免费单条端点限 **45 次/分钟**，超限返回 `HTTP 429`，持�
 
 现在默认走 ip-api **批量端点**（`POST /batch`，一次最多 100 个 IP，限 15 次/分钟）：100 个节点从 100 次请求压到 1 次。脚本内置滑动窗口限流，并读取 `X-Rl`/`X-Ttl` 响应头，配额用尽时自动退避、遇到 429 按 `X-Ttl` 等待重试。同一入口 IP 的多个节点会先去重再查询。
 
-批量端点只接受 IP。所以 `server` 是 IP 的节点走批量端点；`server` 是域名的节点走单条端点（由 ip-api 服务端自行解析域名），单条端点限 45 次/分钟。设了自定义 `api` 会整体切回单条模式。
+批量端点只接受 IP。所以 `server` 是 IP 的节点直接走批量端点。`server` 是域名的节点，默认先用 **DoH** 解析成 IP（默认走国内 AliDNS `https://dns.alidns.com/resolve`，与常见 Clash 配置一致），解析出的 IP 再进批量端点。设了自定义 `api` 会整体切回单条模式，也不做 DoH。
 
-想让域名节点也享受批量端点，可以在本脚本**前面**先接一个 Sub-Store 内置「域名解析」操作（它是核心代码、有 socket 权限，支持 `udp://`/`tcp://`/`tls://`/`https://`），把 `server` 改写成 IP；本脚本对已是 IP 的 `server` 自动走批量。
+为什么要脚本自己解析域名：很多机场入口用 **GeoDNS**，同一域名在境内外解析到完全不同的 IP。若把域名直接交给 ip-api（服务器在境外），它会按境外线路解析，把国内入口误判成境外归属（实测某入口国内解析是腾讯云/百度云，ip-api 境外解析却落到巴西）。先按国内 DNS 解析再查，才和你客户端实际连接的入口一致。同一域名有多条 A 记录（轮询/多云）时取数值最小的 IP，保证结果稳定、名字不来回跳。`dns=false` 可关闭 DoH，退回旧行为（域名直接交给 ip-api 单条端点解析）。
 
 ## 旗帜识别：关键词优先，emoji 兜底
 
@@ -35,11 +35,13 @@ ip-api 免费单条端点限 **45 次/分钟**，超限返回 `HTTP 429`，持�
 | `batch` | `true` | 批量端点；设了 `api` 自动关闭 |
 | `batch_size` | `100` | 每批 IP 数，上限 100 |
 | `rate_limit` | 批量 `15` / 单条 `40` | 每分钟请求上限 |
+| `dns` | `true` | 域名入口先用 DoH 解析成 IP 再查；设了 `api` 自动关闭 |
+| `doh` | AliDNS | DoH JSON 端点（默认 `https://dns.alidns.com/resolve`，可换 `https://doh.pub/resolve` 等） |
 | `api` | ip-api 单条 | 自定义模板，支持 `{{server}}`/`{{proxy.server}}`/`{{lang}}` |
 | `lang` | `zh-CN` | ip-api 语言 |
 | `timeout` | `5000` | 单次请求超时(ms) |
 | `retries` | `1` | 失败重试次数 |
-| `concurrency` | `5` | 单条模式并发 |
+| `concurrency` | `5` | 单条端点 / DoH 解析的并发 |
 | `cache` | `true` | 查询结果缓存 |
 | `cache_ttl` | `43200` | 缓存时长(秒)，默认 12 小时 |
 
@@ -55,13 +57,14 @@ ip-api 免费单条端点限 **45 次/分钟**，超限返回 `HTTP 429`，持�
 
 ## 域名入口
 
-脚本不再内置自定义 DNS。原因：Sub-Store 操作脚本的沙箱里只有 HTTP 客户端（`$.http`），没有原始 UDP/TCP/TLS socket，脚本内顶多只能做 DoH，做不了 `tcp`/`udp`/`tls`(DoT)/`quic`(DoQ)。与其做半套，不如交给专业的：
+`server` 是域名时，脚本默认用 **DoH**（`$.http` 在沙箱里可用）把域名解析成 IP 再查 ip-api，默认解析器是国内 AliDNS，理由见上文「为什么用批量端点」。
 
 - `server` 是 IP → 批量端点（高效）。
-- `server` 是域名 → 单条端点，ip-api 服务端自行解析。
-- 想让域名也走批量、或想指定 `tcp`/`tls`/`doh` 解析：在本脚本前面接 Sub-Store 内置「域名解析」操作，它把域名转成 IP 后本脚本自动批量。
+- `server` 是域名 → 默认 DoH 解析成 IP（`dns=true`），解析出的 IP 再走批量端点；`dns=false` 时退回让 ip-api 服务端自行解析。
+- DoH 只能做 `https` 解析，做不了 `tcp`/`udp`/`tls`(DoT)/`quic`(DoQ)。要指定这些解析方式，仍可在本脚本前面接 Sub-Store 内置「域名解析」操作把域名转成 IP，本脚本对已是 IP 的 `server` 自动走批量。
 
 ## 说明
 
 - 免费端点只走明文 **HTTP**，节点服务器地址会以明文发送给 ip-api，不允许商业用途。
+- `dns=true`（默认）时，域名入口会先经 DoH 发给解析商（默认 AliDNS，走 HTTPS 加密）拿到 IP，再把该 IP 发给 ip-api。介意把机场域名给到解析商的可自定义 `doh` 或设 `dns=false` 关闭。
 - 回归测试见 `test.mjs`：`node test.mjs`。

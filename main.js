@@ -1,37 +1,3 @@
-/**
- * Sub-Store 操作脚本：入口运营商 + 国旗改名（批量端点版）
- *
- * 把节点名改为「入口地区+运营商 + 原节点地区旗帜」，如 杭州电信 🇭🇰、美国 AWS 🇺🇸。
- * 查的是入口 server 的归属，不是落地。
- *
- * 默认走 ip-api 批量端点：100 个 IP 一次请求（单条端点是 100 次），
- * 内置滑动窗口限流 + X-Rl/X-Ttl 退避，节点再多也不会被封。
- *
- * 查询参数：
- *  - batch          批量端点，默认 true（设了 api 会自动关掉）
- *  - batch_size     每批 IP 数，默认 100，上限 100
- *  - rate_limit     每分钟请求上限，默认 批量 15 / 单条 40
- *  - api            自定义单条模板，支持 {{server}} / {{proxy.server}} 占位
- *  - lang           ip-api 语言，默认 zh-CN
- *  - timeout        单次请求超时(ms)，默认 5000
- *  - retries        失败重试次数，默认 1
- *  - concurrency    单条模式并发，默认 5
- *  - cache          查询结果缓存，默认 true
- *  - cache_ttl      缓存时长(秒)，默认 43200（12 小时）
- *
- * 改名参数：
- *  - keep_original  判不出旗帜时保留原名，默认 true
- *  - region         名字带入口地区前缀，默认 true
- *  - emoji_fallback 关键词都不命中时用名字里的旗帜 emoji 兜底，默认 true
- *  - number         重名自动编号，默认 true
- *  - number_sep     编号分隔符，默认空格
- *
- * 域名入口说明：
- *  - server 是 IP 走批量端点；server 是域名走单条端点（ip-api 服务端自行解析）。
- *  - 想让域名也走批量端点，可先接一个 Sub-Store 内置「域名解析」操作把域名转成 IP，
- *    本脚本对已是 IP 的 server 自动批量。
- */
-
 const REGION_MAP = [
   { cc: 'HK', re: /香港|\bhong[\s-]*kong\b|\bhkg\b/i, bare: true },
   { cc: 'MO', re: /澳门|澳門|\bmacao\b|\bmacau\b/i, bare: true },
@@ -269,6 +235,7 @@ const CC_SHORT_NAME = { HK: '香港', MO: '澳门', TW: '台湾' }
 const IPAPI_FIELDS = 'status,message,query,country,countryCode,city,regionName,isp,org,as,asname,mobile,proxy,hosting'
 const IPAPI_BATCH_URL = 'http://ip-api.com/batch'
 const IPAPI_SINGLE_URL = `http://ip-api.com/json/{{server}}`
+const DOH_DEFAULT_URL = 'https://dns.alidns.com/resolve'
 const USER_AGENT = 'Sub-Store-Entrance-ISP-Checker/3.0'
 
 async function operator(proxies = [], targetPlatform, context) {
@@ -291,10 +258,13 @@ async function operator(proxies = [], targetPlatform, context) {
   const batchSize = int(args.batch_size, 100, 1, 100)
   const rateLimit = int(args.rate_limit, batchEnabled ? 15 : 40, 1, 1000)
 
+  const dnsEnabled = customApi ? false : bool(args.dns, true)
+  const dohUrl = String(args.doh || DOH_DEFAULT_URL)
+
   const cacheEnabled = bool(args.cache, true) && !!cache
   const cacheTtl = int(args.cache_ttl, 43200, 60, 2592000) * 1000
 
-  const stats = { total: proxies.length, renamed: 0, cached: 0, failed: 0, requests: 0 }
+  const stats = { total: proxies.length, renamed: 0, cached: 0, failed: 0, requests: 0, dns: 0 }
 
   const targets = []
   for (const proxy of proxies) {
@@ -327,31 +297,60 @@ async function operator(proxies = [], targetPlatform, context) {
   const limiter = makeLimiter(rateLimit, ms => $.wait(ms))
   const pendingList = [...pending.keys()]
   if (pendingList.length) {
-    const batchable = batchEnabled ? pendingList.filter(isIP) : []
-    const single = batchEnabled ? pendingList.filter(t => !isIP(t)) : pendingList
-    if (batchable.length) {
-      const chunks = chunk(batchable, batchSize)
-      $.info(`[查询] 批量端点 ${batchable.length} 个 IP / ${chunks.length} 次请求（限流 ${rateLimit}/分钟）`)
+    const resolvedIp = new Map()
+    if (dnsEnabled) {
+      const domains = pendingList.filter(t => !isIP(t))
+      if (domains.length) {
+        $.info(`[DNS] 用 DoH 解析 ${domains.length} 个域名入口（${dohUrl}）`)
+        await pool(domains, concurrency, async domain => {
+          try {
+            const ip = await resolveDoh(domain)
+            if (ip) resolvedIp.set(domain, ip)
+          } catch (error) {
+            $.error(`[DNS] ${domain} 解析失败: ${msg(error)}`)
+          }
+        })
+      }
+    }
+
+    const queryTargetOf = new Map()
+    for (const server of pendingList) {
+      queryTargetOf.set(server, isIP(server) ? server : resolvedIp.get(server) || server)
+    }
+    const batchServers = []
+    const singleServers = []
+    for (const server of pendingList) {
+      if (batchEnabled && isIP(queryTargetOf.get(server))) batchServers.push(server)
+      else singleServers.push(server)
+    }
+
+    if (batchServers.length) {
+      const ipList = [...new Set(batchServers.map(s => queryTargetOf.get(s)))]
+      const chunks = chunk(ipList, batchSize)
+      $.info(`[查询] 批量端点 ${ipList.length} 个 IP / ${chunks.length} 次请求（限流 ${rateLimit}/分钟）`)
+      const bodyByIp = new Map()
       for (const group of chunks) {
         try {
           const list = await queryBatch(group)
-          group.forEach((target, index) => storeBody(target, list[index]))
+          group.forEach((ip, index) => bodyByIp.set(ip, list[index]))
         } catch (error) {
           $.error(`[查询] 批量请求失败（${group.length} 个 IP）: ${msg(error)}`)
         }
       }
+      for (const server of batchServers) storeBody(server, bodyByIp.get(queryTargetOf.get(server)))
     }
-    if (single.length) {
+
+    if (singleServers.length) {
       if (batchEnabled) {
-        $.info(`[查询] ${single.length} 个域名入口无法进批量端点（只收 IP），改用单条端点；如需批量可先接 Sub-Store 内置「域名解析」把域名转成 IP`)
+        $.info(`[查询] ${singleServers.length} 个域名入口未解析出 IP，改用单条端点（由 ip-api 服务端解析，可能按境外线路）`)
       } else {
-        $.info(`[查询] 单条端点 ${single.length} 个目标（限流 ${rateLimit}/分钟）`)
+        $.info(`[查询] 单条端点 ${singleServers.length} 个目标（限流 ${rateLimit}/分钟）`)
       }
-      await pool(single, batchEnabled ? Math.min(concurrency, 3) : concurrency, async target => {
+      await pool(singleServers, batchEnabled ? Math.min(concurrency, 3) : concurrency, async server => {
         try {
-          storeBody(target, await querySingle(target))
+          storeBody(server, await querySingle(queryTargetOf.get(server)))
         } catch (error) {
-          $.error(`[查询] ${target} 失败: ${msg(error)}`)
+          $.error(`[查询] ${server} 失败: ${msg(error)}`)
         }
       })
     }
@@ -381,7 +380,7 @@ async function operator(proxies = [], targetPlatform, context) {
   if (numberEnabled) numberDuplicates(proxies, numberSep)
 
   $.info(
-    `[汇总] 节点 ${stats.total} / 改名 ${stats.renamed} / 命中缓存 ${stats.cached} / 查询失败 ${stats.failed} / HTTP 请求 ${stats.requests}`
+    `[汇总] 节点 ${stats.total} / 改名 ${stats.renamed} / 命中缓存 ${stats.cached} / 查询失败 ${stats.failed} / DoH ${stats.dns} / HTTP 请求 ${stats.requests}`
   )
 
   return proxies
@@ -397,6 +396,28 @@ async function operator(proxies = [], targetPlatform, context) {
   function bodyCacheKey(target) {
     const ident = batchEnabled ? `batch:${IPAPI_BATCH_URL}:${lang}` : `single:${customApi || IPAPI_SINGLE_URL}:${lang}`
     return `isp-flag:v3:${hash(ident)}:${target}`
+  }
+
+  async function resolveDoh(domain) {
+    const key = `isp-flag:doh:${hash(dohUrl)}:${domain}`
+    if (cacheEnabled) {
+      const hit = cache.get(key)
+      if (typeof hit === 'string') return hit || null
+    }
+    const url = `${dohUrl}${dohUrl.includes('?') ? '&' : '?'}name=${encodeURIComponent(domain)}&type=A`
+    const res = await $.http.get({ url, timeout, headers: { 'user-agent': USER_AGENT, accept: 'application/dns-json' } })
+    stats.dns++
+    const data = parseJson(res)
+    const answers = data && Array.isArray(data.Answer) ? data.Answer : []
+    const ips = []
+    for (const answer of answers) {
+      const value = String(answer && answer.data != null ? answer.data : '')
+      if (isIPv4(value)) ips.push(value)
+    }
+    ips.sort(compareIPv4)
+    const ip = ips[0] || ''
+    if (cacheEnabled) cache.set(key, ip, ip ? cacheTtl : 600000)
+    return ip || null
   }
 
   async function queryBatch(ips) {
@@ -490,14 +511,16 @@ async function operator(proxies = [], targetPlatform, context) {
 
   function classifyProvider(info) {
     const text = [info.isp, info.org, info.as, info.asname].filter(Boolean).join(' ')
-    if (!text) return info.hosting === true ? '云厂商' : '未知运营商'
-    for (const [rule, name] of CLOUD_RULES) if (rule.test(text)) return name
-    for (const [rule, name] of CN_ISP_RULES) if (rule.test(text)) return name
-    for (const [rule, name] of CARRIER_RULES) if (rule.test(text)) return name
+    if (text) {
+      for (const [rule, name] of CLOUD_RULES) if (rule.test(text)) return name
+      for (const [rule, name] of CN_ISP_RULES) if (rule.test(text)) return name
+      for (const [rule, name] of CARRIER_RULES) if (rule.test(text)) return name
+    }
     if (info.mobile === true) return '移动网络'
+    const named = String(info.org || info.isp || info.asname || '').trim()
+    if (named) return named.slice(0, 24).trim()
     if (info.hosting === true) return '云厂商'
-    const fallback = String(info.asname || info.org || info.isp || '').trim()
-    return fallback.slice(0, 24).trim() || '未知运营商'
+    return '未知运营商'
   }
 
   function regionFlag(name) {
@@ -644,6 +667,15 @@ function isIPv6(value) {
 
 function isIP(value) {
   return isIPv4(value) || isIPv6(value)
+}
+
+function compareIPv4(a, b) {
+  const pa = String(a).split('.').map(Number)
+  const pb = String(b).split('.').map(Number)
+  for (let i = 0; i < 4; i++) {
+    if (pa[i] !== pb[i]) return pa[i] - pb[i]
+  }
+  return 0
 }
 
 function hash(input) {
